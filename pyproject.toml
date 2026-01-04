@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videoprose"
+version = "1.0.0"
+description = "将长视频转化为具备深度阅读感的结构化长文"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "VideoProse Team"}
+]
+keywords = ["video", "transcription", "llm", "content-creation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Content Creators",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+videoprose = "videoprose.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
