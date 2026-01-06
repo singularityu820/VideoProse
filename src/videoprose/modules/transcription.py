@@ -1,9 +1,8 @@
-"""
-转录与对齐模块 (Transcription & Alignment)
+"""Transcription & alignment utilities."""
 
-将音频转化为带时间轴的文本。
-"""
-
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +18,7 @@ def get_whisper_model(model_name: Optional[str] = None):
     """获取或加载 Whisper 模型（带缓存）"""
     global _whisper_model, _whisper_model_name
     
-    from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel  # type: ignore
     
     config = get_config()
     whisper_config = config.whisper
@@ -72,40 +71,50 @@ def speech_to_text(
     audio: AudioFile,
     model: Optional[str] = None,
     language: Optional[str] = None,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    prefer_fast: bool = False,
 ) -> list[TranscriptSegment]:
-    """
-    语音转文字
-    
-    调用 Faster-Whisper 模型进行 ASR 转录。
-    
-    Args:
-        audio: 音频文件信息
-        model: Whisper 模型名称，默认使用配置文件中的设置
-        language: 语言代码，None 表示自动检测
-        
-    Returns:
-        list[TranscriptSegment]: 带时间戳的转录片段列表
-    """
+    """语音转文字，支持 Whisper 与 Qwen ASR，长音频可自动加速"""
     config = get_config()
+    asr_provider = (provider or config.asr_provider or "whisper").lower()
+
+    if asr_provider == "qwen":
+        return _transcribe_with_qwen(
+            audio,
+            model=model or config.qwen_asr.model,
+            api_key=api_key or config.qwen_asr.api_key,
+            base_url=base_url or config.qwen_asr.base_url,
+            language=language,
+            chunk_on_long=config.qwen_asr.chunk_on_long,
+            max_chunk_seconds=config.qwen_asr.max_chunk_seconds,
+        )
+
     whisper_config = config.whisper
-    
-    # 使用缓存的模型
-    whisper_model = get_whisper_model(model)
-    
-    # 转录
+    fast_enabled = prefer_fast or (
+        audio.duration and audio.duration / 60.0 >= whisper_config.fast_threshold_minutes
+    )
+    whisper_model_name = (
+        whisper_config.fast_model if (fast_enabled and whisper_config.fast_model) else (model or whisper_config.model)
+    )
+    whisper_model = get_whisper_model(whisper_model_name)
+
+    beam_size = whisper_config.fast_beam_size if fast_enabled else 5
+    word_timestamps = whisper_config.fast_word_timestamps if fast_enabled else True
+
     segments_iter, _info = whisper_model.transcribe(
         audio.file_path,
         language=language or whisper_config.language,
-        beam_size=5,
-        word_timestamps=True,
-        vad_filter=True,  # 启用 VAD 过滤静音
+        beam_size=beam_size,
+        word_timestamps=word_timestamps,
+        vad_filter=True,
         vad_parameters={
             "min_silence_duration_ms": 500,
             "speech_pad_ms": 200,
         },
     )
-    
-    # 转换为 TranscriptSegment 列表
+
     segments = []
     for segment in segments_iter:
         segments.append(TranscriptSegment(
@@ -113,8 +122,199 @@ def speech_to_text(
             end_time=segment.end,
             text=segment.text.strip(),
         ))
-    
+
     return segments
+
+
+def _transcribe_with_qwen(
+    audio: AudioFile,
+    model: str,
+    api_key: Optional[str],
+    base_url: Optional[str] = None,
+    language: Optional[str] = None,
+    chunk_on_long: bool = True,
+    max_chunk_seconds: int = 280,
+) -> list[TranscriptSegment]:
+    """使用 Qwen ASR；长音频可分段串行转写"""
+    if not api_key:
+        raise RuntimeError("使用 Qwen ASR 需要配置 DASHSCOPE_API_KEY 或在请求中提供 asrApiKey")
+
+    if chunk_on_long and audio.duration and audio.duration > max_chunk_seconds:
+        return _transcribe_qwen_chunked(
+            audio,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            language=language,
+            max_chunk_seconds=max_chunk_seconds,
+        )
+
+    return _transcribe_qwen_single(
+        audio_path=Path(audio.file_path),
+        duration=audio.duration,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        language=language,
+    )
+
+
+def _transcribe_qwen_single(
+    audio_path: Path,
+    duration: float,
+    model: str,
+    api_key: str,
+    base_url: Optional[str],
+    language: Optional[str],
+) -> list[TranscriptSegment]:
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    with open(audio_path, "rb") as f:
+        response = client.audio.transcriptions.create(
+            model=model,
+            file=f,
+            language=language,
+            response_format="verbose_json",
+        )
+
+    verbose_segments = _extract_qwen_segments(response)
+    if verbose_segments:
+        return verbose_segments
+
+    final_text = getattr(response, "text", None) or (response.get("text") if isinstance(response, dict) else None)
+    if final_text:
+        return [
+            TranscriptSegment(
+                start_time=0.0,
+                end_time=duration or 0.0,
+                text=str(final_text).strip(),
+            )
+        ]
+
+    raise RuntimeError("Qwen ASR 未返回任何转录结果")
+
+
+def _extract_qwen_segments(response: object) -> list[TranscriptSegment]:
+    """提取 Qwen ASR 段落结果"""
+    raw_segments = getattr(response, "segments", None)
+    if raw_segments is None and hasattr(response, "json"):
+        raw_segments = response.json().get("segments")
+
+    segments: list[TranscriptSegment] = []
+    if not raw_segments:
+        return segments
+
+    for seg in raw_segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        segments.append(TranscriptSegment(
+            start_time=start,
+            end_time=end,
+            text=text,
+        ))
+
+    return segments
+
+
+def _transcribe_qwen_chunked(
+    audio: AudioFile,
+    model: str,
+    api_key: str,
+    base_url: Optional[str],
+    language: Optional[str],
+    max_chunk_seconds: int,
+) -> list[TranscriptSegment]:
+    """将长音频分段后串行调用 Qwen ASR"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        chunk_paths = _split_audio_to_chunks(Path(audio.file_path), Path(temp_dir), max_chunk_seconds)
+        offsets = _probe_chunk_durations(chunk_paths)
+        segments: list[TranscriptSegment] = []
+
+        for idx, chunk_path in enumerate(chunk_paths):
+            chunk_duration = offsets[idx]
+            chunk_segments = _transcribe_qwen_single(
+                audio_path=chunk_path,
+                duration=chunk_duration,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                language=language,
+            )
+
+            start_offset = sum(offsets[:idx])
+            for seg in chunk_segments:
+                segments.append(
+                    TranscriptSegment(
+                        start_time=seg.start_time + start_offset,
+                        end_time=seg.end_time + start_offset,
+                        text=seg.text,
+                    )
+                )
+
+        return segments
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _split_audio_to_chunks(source: Path, out_dir: Path, max_chunk_seconds: int) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / "chunk_%03d.wav"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(max_chunk_seconds),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(pattern),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"音频分段失败: {result.stderr.decode('utf-8', errors='replace')}")
+
+    return sorted(out_dir.glob("chunk_*.wav"))
+
+
+def _probe_chunk_durations(paths: list[Path]) -> list[float]:
+    durations: list[float] = []
+    for p in paths:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(p),
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            durations.append(0.0)
+            continue
+        try:
+            durations.append(float(result.stdout.decode().strip()))
+        except ValueError:
+            durations.append(0.0)
+    return durations
 
 
 def merge_short_segments(

@@ -53,7 +53,7 @@ def detect_platform(url: str) -> SourcePlatform:
         return SourcePlatform.LOCAL
 
 
-def fetch_metadata(url: str) -> Metadata:
+def fetch_metadata(url: str, allow_local: bool = False) -> Metadata:
     """
     获取视频元数据
     
@@ -66,6 +66,17 @@ def fetch_metadata(url: str) -> Metadata:
     import json
     
     platform = detect_platform(url)
+    if allow_local and Path(url).exists():
+        path = Path(url)
+        duration = _get_audio_duration(path) if path.suffix.lower() in {".wav", ".mp3", ".m4a", ".flac"} else 0.0
+        return Metadata(
+            title=path.stem,
+            author="local",
+            duration=duration,
+            original_language="zh",
+            platform=SourcePlatform.LOCAL,
+            url=str(path),
+        )
     
     # 使用 yt-dlp 获取元数据
     cmd = [
@@ -131,28 +142,40 @@ def extract_audio(url: str, output_dir: Optional[Path] = None) -> AudioFile:
     # 生成输出文件名
     output_path = output_dir / "audio.wav"
     
-    # 使用 yt-dlp 下载并转换音频
-    cmd = [
-        _get_ytdlp_path(),
-        *_ytdlp_base_args(),
-        "-x",  # 仅提取音频
-        "--audio-format", "wav",
-        "--audio-quality", "0",
-        "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1",  # 16kHz 单声道
-        "-o", str(output_path),
-        url
-    ]
-    
+    if Path(url).exists():
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(url),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            _get_ytdlp_path(),
+            *_ytdlp_base_args(),
+            "-x",  # 仅提取音频
+            "--audio-format", "wav",
+            "--audio-quality", "0",
+            "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1",  # 16kHz 单声道
+            "-o", str(output_path),
+            url
+        ]
+
     try:
         subprocess.run(
             cmd,
             capture_output=True,
             check=True,
         )
-        
-        # 获取音频时长
         duration = _get_audio_duration(output_path)
-        
         return AudioFile(
             file_path=str(output_path),
             sample_rate=16000,
@@ -328,30 +351,42 @@ def _download_subtitle_vtt(url: str, lang: str, tmpdir: str) -> list[TranscriptS
 def _parse_vtt(vtt_path: Path) -> list[TranscriptSegment]:
     """解析 VTT 字幕文件"""
     segments = []
-    
     with open(vtt_path, "r", encoding="utf-8") as f:
         content = f.read()
-    
-    # VTT 时间戳格式: 00:00:00.000 --> 00:00:00.000
-    pattern = r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*\n(.+?)(?=\n\n|\Z)"
-    
-    for match in re.finditer(pattern, content, re.DOTALL):
-        start_str, end_str, text = match.groups()
-        
-        start_time = _parse_timestamp(start_str)
-        end_time = _parse_timestamp(end_str)
-        
-        # 清理文本
-        text = re.sub(r"<[^>]+>", "", text)  # 移除 HTML 标签
-        text = text.strip()
-        
-        if text:
-            segments.append(TranscriptSegment(
-                start_time=start_time,
-                end_time=end_time,
-                text=text,
-            ))
-    
+
+    blocks = [b.strip() for b in content.split("\n\n") if b.strip()]
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 2:
+            continue
+        if "-->" not in lines[0]:
+            # 可能首行是序号
+            if len(lines) < 3 or "-->" not in lines[1]:
+                continue
+            time_line = lines[1]
+            text_lines = lines[2:]
+        else:
+            time_line = lines[0]
+            text_lines = lines[1:]
+
+        try:
+            start_str, end_str = [x.strip() for x in time_line.split("-->")]
+            start_time = _parse_timestamp(start_str)
+            end_time = _parse_timestamp(end_str)
+        except Exception:
+            continue
+
+        text = " ".join(text_lines)
+        text = re.sub(r"<[^>]+>", "", text).strip()
+        if not text:
+            continue
+
+        segments.append(TranscriptSegment(
+            start_time=start_time,
+            end_time=end_time,
+            text=text,
+        ))
+
     return segments
 
 

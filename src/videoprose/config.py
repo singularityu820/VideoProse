@@ -46,6 +46,21 @@ class WhisperConfig:
     device: str = "cuda"
     compute_type: str = "float16"
     language: Optional[str] = None  # None 表示自动检测
+    # 长音频加速参数
+    fast_model: Optional[str] = None  # 可选：medium / small 等，None 表示仍用主模型
+    fast_threshold_minutes: int = 20  # 超过该分钟数启用加速策略
+    fast_beam_size: int = 1  # 加速模式下的 beam size
+    fast_word_timestamps: bool = False  # 长音频默认关闭逐词时间戳以提速
+
+
+@dataclass
+class QwenASRConfig:
+    """Qwen ASR 配置"""
+    model: str = "qwen3-asr-flash"
+    api_key: Optional[str] = None
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    chunk_on_long: bool = True
+    max_chunk_seconds: int = 280  # 每段最长 4 分 40 秒，兼容 5 分钟限制
 
 
 @dataclass
@@ -61,7 +76,9 @@ class ChunkingConfig:
 class Config:
     """全局配置"""
     llm: LLMConfig = field(default_factory=LLMConfig)
+    asr_provider: Literal["whisper", "qwen"] = "whisper"
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
+    qwen_asr: QwenASRConfig = field(default_factory=QwenASRConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     output_dir: Path = field(default_factory=lambda: Path("./output"))
 
@@ -79,10 +96,25 @@ class Config:
             api_key=os.getenv(f"{os.getenv('DEFAULT_LLM_PROVIDER', 'ANTHROPIC').upper()}_API_KEY"),
         )
 
+        asr_provider = os.getenv("ASR_PROVIDER", "whisper")
+
         whisper_config = WhisperConfig(
             model=os.getenv("WHISPER_MODEL", "large-v3"),
             device=os.getenv("WHISPER_DEVICE", "cuda"),
             compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16"),
+            language=os.getenv("WHISPER_LANGUAGE") or None,
+            fast_model=os.getenv("WHISPER_FAST_MODEL") or None,
+            fast_threshold_minutes=int(os.getenv("WHISPER_FAST_THRESHOLD_MINUTES", "20")),
+            fast_beam_size=int(os.getenv("WHISPER_FAST_BEAM_SIZE", "1")),
+            fast_word_timestamps=os.getenv("WHISPER_FAST_WORD_TIMESTAMPS", "false").lower() == "true",
+        )
+
+        qwen_asr_config = QwenASRConfig(
+            model=os.getenv("QWEN_ASR_MODEL", "qwen3-asr-flash"),
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            chunk_on_long=os.getenv("QWEN_ASR_CHUNK_ON_LONG", "true").lower() == "true",
+            max_chunk_seconds=int(os.getenv("QWEN_ASR_MAX_CHUNK_SECONDS", "280")),
         )
 
         chunking_config = ChunkingConfig(
@@ -95,7 +127,9 @@ class Config:
 
         return cls(
             llm=llm_config,
+            asr_provider=asr_provider if asr_provider in ["whisper", "qwen"] else "whisper",
             whisper=whisper_config,
+            qwen_asr=qwen_asr_config,
             chunking=chunking_config,
             output_dir=output_dir,
         )

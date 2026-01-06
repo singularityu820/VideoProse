@@ -77,8 +77,8 @@ python -m videoprose.cli process "URL" --provider openai --model gpt-4o
 
 ```bash
 # 1. 启动后端 API 服务
-cd src/videoprose
-uvicorn api:app --reload --port 8000
+cd src
+uvicorn videoprose.api:app --reload --port 8000
 
 # 2. 启动前端开发服务器（新终端）
 cd web

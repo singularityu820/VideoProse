@@ -11,7 +11,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 # 尽早加载配置（确保 HF_HOME 等环境变量生效）
-from .config import get_config
+from .config import get_config, Config, LLMConfig, ChunkingConfig, WhisperConfig, QwenASRConfig
 get_config()
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -23,6 +23,110 @@ tasks: dict = {}
 
 # Whisper 模型是否已加载
 _whisper_loaded = False
+
+
+def _build_runtime_config(request: "ProcessRequest"):
+    """组装 LLM 与 ASR 运行时配置"""
+    current_config = get_config()
+    env_provider = current_config.llm.provider
+    env_model = current_config.llm.model
+    env_api_key = current_config.llm.api_key
+
+    provider = request.provider or env_provider
+    model = request.model or env_model
+    api_key = request.apiKey or os.getenv(f"{provider.upper()}_API_KEY") or env_api_key
+    fallback_message = None
+
+    if not api_key:
+        fallback_key = os.getenv(f"{env_provider.upper()}_API_KEY") or env_api_key
+        if fallback_key:
+            provider = env_provider
+            model = env_model
+            api_key = fallback_key
+            fallback_message = f"未找到 {request.provider or '指定'} 的 API Key，已回退到默认 {env_provider}"
+
+    asr_provider = (request.asrProvider or current_config.asr_provider or "whisper").lower()
+
+    whisper_config = WhisperConfig(
+        model=request.asrModel if (asr_provider == "whisper" and request.asrModel) else current_config.whisper.model,
+        device=current_config.whisper.device,
+        compute_type=current_config.whisper.compute_type,
+        language=current_config.whisper.language,
+        fast_model=current_config.whisper.fast_model,
+        fast_threshold_minutes=current_config.whisper.fast_threshold_minutes,
+        fast_beam_size=current_config.whisper.fast_beam_size,
+        fast_word_timestamps=current_config.whisper.fast_word_timestamps,
+    )
+
+    qwen_asr_config = QwenASRConfig(
+        model=request.asrModel or current_config.qwen_asr.model,
+        api_key=request.asrApiKey or current_config.qwen_asr.api_key,
+        base_url=request.asrBaseUrl or current_config.qwen_asr.base_url,
+    )
+
+    config = Config(
+        llm=LLMConfig(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+        ),
+        asr_provider=asr_provider,
+        whisper=whisper_config,
+        qwen_asr=qwen_asr_config,
+        chunking=ChunkingConfig(
+            target_length=request.targetLength,
+            context_overlap_ratio=request.contextOverlap,
+        ),
+    )
+
+    return config, provider, model, api_key, asr_provider, fallback_message, current_config
+
+
+def _get_transcript_segments(
+    request: "ProcessRequest",
+    config: Config,
+    asr_provider: str,
+    long_audio: bool,
+    update_task_fn,
+    task_id: str,
+):
+    """优先字幕，缺失时走 ASR；支持本地文件"""
+    from .modules import get_subtitle, extract_audio, speech_to_text
+    from .models import TranscriptSegment
+    import os
+
+    if request.sourceType == "subtitle" and request.subtitleText:
+        lines = [l.strip() for l in request.subtitleText.splitlines() if l.strip()]
+        segments: list[TranscriptSegment] = []
+        for idx, line in enumerate(lines):
+            start = float(idx) * 3.0
+            end = start + 3.0
+            segments.append(TranscriptSegment(start_time=start, end_time=end, text=line))
+        return segments
+
+    # subtitle from remote
+    if request.sourceType != "local-audio":
+        segments = get_subtitle(request.url)
+        if segments:
+            return segments
+
+    update_task_fn(task_id, "ASR 转录中...", 25)
+    # 支持本地文件路径（含 file://）
+    local_path = request.url.replace("file://", "") if request.url.startswith("file://") else request.url
+    if request.sourceType == "local-audio" and os.path.exists(local_path):
+        audio = extract_audio(local_path)
+    else:
+        audio = extract_audio(request.url)
+
+    return speech_to_text(
+        audio,
+        model=config.whisper.model if asr_provider == "whisper" else config.qwen_asr.model,
+        language=config.whisper.language,
+        provider=asr_provider,
+        api_key=config.qwen_asr.api_key,
+        base_url=config.qwen_asr.base_url,
+        prefer_fast=long_audio,
+    )
 
 
 @asynccontextmanager
@@ -69,6 +173,12 @@ class ProcessRequest(BaseModel):
     provider: str = "anthropic"
     model: str = "claude-3-5-sonnet-20241022"
     apiKey: Optional[str] = None
+    sourceType: str = "auto"  # auto | local-audio | local-video | subtitle
+    subtitleText: Optional[str] = None
+    asrProvider: str = "whisper"
+    asrModel: Optional[str] = None
+    asrApiKey: Optional[str] = None
+    asrBaseUrl: Optional[str] = None
     targetLength: int = 1200
     contextOverlap: float = 0.1
 
@@ -181,94 +291,67 @@ def process_video_task(task_id: str, request: ProcessRequest):
     task = tasks[task_id]
     
     try:
-        # 配置
-        from .config import Config, LLMConfig, ChunkingConfig, set_config, get_config
+        from .config import set_config
         from .llm import create_llm_client, set_llm_client
-        
-        current_config = get_config()
-        env_provider = current_config.llm.provider
-        env_model = current_config.llm.model
-        env_api_key = current_config.llm.api_key
+        from .modules import fetch_metadata, get_subtitle, extract_audio
 
-        # 解析 LLM 配置
-        provider = request.provider or env_provider
-        model = request.model or env_model
-        api_key = request.apiKey
-        if not api_key:
-            env_key = os.getenv(f"{provider.upper()}_API_KEY")
-            api_key = env_key or env_api_key
-
-        # 如果指定的 provider 缺少 key，则自动回退到默认 provider（deepseek）
-        if not api_key:
-            fallback_key = os.getenv(f"{env_provider.upper()}_API_KEY") or env_api_key
-            if fallback_key:
-                provider = env_provider
-                model = env_model
-                api_key = fallback_key
-                add_message(task_id, f"未找到 {request.provider or '指定'} 的 API Key，已回退到默认 {env_provider}")
-
-        llm_config = LLMConfig(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-        )
-        config = Config(
-            llm=llm_config,
-            chunking=ChunkingConfig(
-                target_length=request.targetLength,
-                context_overlap_ratio=request.contextOverlap,
-            ),
-            # 保持当前的 Whisper 配置，避免被默认 large-v3 覆盖
-            whisper=current_config.whisper,
-        )
+        config, provider, model, api_key, asr_provider, fallback_message, current_config = _build_runtime_config(request)
         set_config(config)
-        
-        if api_key:
-            client = create_llm_client(
-                provider=provider,
-                api_key=api_key,
-                model=model,
-            )
-            set_llm_client(client)
-        else:
+        if fallback_message:
+            add_message(task_id, fallback_message)
+        if not api_key:
             raise HTTPException(status_code=400, detail="缺少对应提供商的 API Key")
-        
+
+        client = create_llm_client(provider=provider, api_key=api_key, model=model)
+        set_llm_client(client)
+
         # Step 1: 获取视频信息
         update_task(task_id, "获取视频信息...", 10)
-        from .modules import fetch_metadata, get_subtitle, extract_audio
-        
-        metadata = fetch_metadata(request.url)
+        keyframe_eligible = True
+        if request.sourceType == "subtitle" and request.subtitleText:
+            from .models import Metadata, SourcePlatform
+            metadata = Metadata(title="本地字幕", author="local", duration=0, platform=SourcePlatform.LOCAL)
+            keyframe_eligible = False
+        elif request.sourceType in ["local-audio", "local-video"]:
+            metadata = fetch_metadata(request.url, allow_local=True)
+            keyframe_eligible = request.sourceType == "local-video"
+        else:
+            metadata = fetch_metadata(request.url)
+
         task["metadata"] = {
             "title": metadata.title,
             "author": metadata.author,
             "duration": metadata.duration,
         }
+        task["keyframeEligible"] = keyframe_eligible
         add_message(task_id, f"✓ 视频: {metadata.title}")
-        
+        long_audio = bool(metadata.duration and metadata.duration >= current_config.whisper.fast_threshold_minutes * 60)
+
         # Step 2: 获取转录
         update_task(task_id, "提取字幕...", 20)
-        from .modules import speech_to_text, merge_short_segments, get_full_transcript
-        
-        segments = get_subtitle(request.url)
-        if not segments:
-            update_task(task_id, "ASR 转录中...", 25)
-            audio = extract_audio(request.url)
-            segments = speech_to_text(audio)
-        
+        from .modules import merge_short_segments, get_full_transcript
+
+        segments = _get_transcript_segments(
+            request,
+            config,
+            asr_provider,
+            long_audio,
+            update_task,
+            task_id,
+        )
+
         segments = merge_short_segments(segments)
         full_text = get_full_transcript(segments)
         task["segments"] = [{"start": s.start_time, "end": s.end_time, "text": s.text} for s in segments]
         task["fullText"] = full_text
         add_message(task_id, f"✓ 转录完成 ({len(segments)} 个片段)")
-        
+
         # Step 3: 构建知识库
         update_task(task_id, "构建知识库...", 40)
         from .modules import build_glossary
-        
         kb = build_glossary(full_text)
         task["knowledgeBase"] = kb
-        
-        # 转换为前端格式
+
         glossary_data = {
             "entities": [
                 {
@@ -288,12 +371,11 @@ def process_video_task(task_id: str, request: ProcessRequest):
         }
         task["glossary"] = glossary_data
         add_message(task_id, f"✓ 提取术语 {len(kb.entities)} 个")
-        
-        # 暂停等待用户确认
+
         task["status"] = "glossary-review"
         task["currentStep"] = "等待确认术语表..."
         task["progress"] = 45
-        
+
     except Exception as e:  # noqa: BLE001
         import traceback
         task["status"] = "error"
@@ -308,117 +390,81 @@ def process_video_task(task_id: str, request: ProcessRequest):
 def continue_processing_task(task_id: str):
     """继续处理的后台任务"""
     task = tasks[task_id]
-    
     try:
         from .models import (
             TranscriptSegment,
             KnowledgeBase,
             Entity,
             ToneProfile,
+            Metadata,
         )
         from .modules import semantic_split, refine_segment, synthesize_article
-        
-        # 重建数据结构
-        segments = [
-            TranscriptSegment(
-                start_time=s["start"],
-                end_time=s["end"],
-                text=s["text"],
-            )
-            for s in task["segments"]
-        ]
-        
-        glossary = task["glossary"]
-        kb = KnowledgeBase(
-            entities=[
-                Entity(
-                    term=e["term"],
-                    translation=e["translation"],
-                    definition=e["definition"],
-                    entity_type=e["entityType"],
+
+        def _restore_segments_and_kb(task_state):
+            segments_restored = [
+                TranscriptSegment(
+                    start_time=s["start"],
+                    end_time=s["end"],
+                    text=s["text"],
                 )
-                for e in glossary["entities"]
-            ],
-            tone_profile=ToneProfile(
-                style=glossary["toneProfile"]["style"],
-                emotion_keywords=glossary["toneProfile"]["emotionKeywords"],
-                audience=glossary["toneProfile"]["audience"],
-            ),
-            core_theme=glossary["coreTheme"],
-        )
-        
+                for s in task_state["segments"]
+            ]
+
+            glossary = task_state["glossary"]
+            kb_restored = KnowledgeBase(
+                entities=[
+                    Entity(
+                        term=e["term"],
+                        translation=e["translation"],
+                        definition=e["definition"],
+                        entity_type=e["entityType"],
+                    )
+                    for e in glossary["entities"]
+                ],
+                tone_profile=ToneProfile(
+                    style=glossary["toneProfile"]["style"],
+                    emotion_keywords=glossary["toneProfile"]["emotionKeywords"],
+                    audience=glossary["toneProfile"]["audience"],
+                ),
+                core_theme=glossary["coreTheme"],
+            )
+            return segments_restored, kb_restored
+
+        segments, kb = _restore_segments_and_kb(task)
         # Step 4: 语义切片
-        update_task(task_id, "语义切片...", 50)
+        update_task(task_id, "语义切片...", 55)
         chunks = semantic_split(segments)
         add_message(task_id, f"✓ 切分为 {len(chunks)} 个片段")
-        
-        # Step 5: 文本精修
-        update_task(task_id, "文本精修...", 55)
-        from .models import ProcessedChunk
-        import concurrent.futures
-        
-        total_duration = task["metadata"]["duration"] if task.get("metadata") else None
-        
-        def process_single_chunk(i, chunk):
-            # 计算位置信息
-            if total_duration and chunk.start_time:
-                ratio = chunk.start_time / total_duration
-                if ratio < 0.1:
-                    position = "开头部分"
-                elif ratio < 0.3:
-                    position = "前期部分"
-                elif ratio < 0.7:
-                    position = "中间部分"
-                elif ratio < 0.9:
-                    position = "后期部分"
-                else:
-                    position = "结尾部分"
-            else:
-                position = f"第 {i + 1} 段"
-            
-            # 并行处理时，上下文信息较弱，我们可以传入前一段的原始文本摘要（如果需要）
-            # 这里简单处理，不传 context_summary
-            return refine_segment(
+
+        # Step 5: 片段精修（顺序执行保证上下文稳定）
+        processed_chunks = []
+        for i, chunk in enumerate(chunks):
+            position = f"第 {i + 1} 段"
+            update_task(task_id, f"精修 {position}...", 60 + int((i / max(len(chunks), 1)) * 25))
+            refined = refine_segment(
                 current_chunk=chunk,
-                context_summary="", # 并行模式下暂不提供上文摘要
+                context_summary="",
                 kb=kb,
                 position_info=position,
             )
+            processed_chunks.append(refined)
 
-        processed_chunks = [None] * len(chunks)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_index = {executor.submit(process_single_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_index):
-                i = future_to_index[future]
-                try:
-                    processed = future.result()
-                    processed_chunks[i] = processed
-                    completed += 1
-                    progress = 55 + int((completed / len(chunks)) * 25)
-                    update_task(task_id, f"精修片段 {completed}/{len(chunks)}...", progress)
-                except Exception as e:
-                    add_message(task_id, f"片段 {i+1} 处理失败: {e}")
-                    raise e
-        
         add_message(task_id, f"✓ 完成 {len(processed_chunks)} 个片段精修")
-        
+
         # Step 6: 生成文档
         update_task(task_id, "生成文档...", 90)
-        from .models import Metadata
-        
         metadata = Metadata(
             title=task["metadata"]["title"],
             author=task["metadata"]["author"],
             duration=task["metadata"]["duration"],
         )
-        
+
         document = synthesize_article(
             processed_chunks=processed_chunks,
             metadata=metadata,
             kb=kb,
         )
-        
+
         # 转换为前端格式
         result = {
             "title": document.title,
@@ -428,13 +474,13 @@ def continue_processing_task(task_id: str):
             "body": document.body,
             "highlights": document.highlights,
         }
-        
+
         task["result"] = result
         task["status"] = "completed"
         task["currentStep"] = "处理完成"
         task["progress"] = 100
         add_message(task_id, "✓ 文档生成完成")
-        
+
     except Exception as e:  # noqa: BLE001
         import traceback
         task["status"] = "error"

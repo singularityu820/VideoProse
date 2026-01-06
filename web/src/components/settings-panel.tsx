@@ -10,6 +10,10 @@ interface SettingsProps {
     provider: string
     model: string
     apiKey: string
+    asrProvider: string
+    asrModel: string
+    asrApiKey: string
+    asrBaseUrl: string
     targetLength: number
     contextOverlap: number
   }
@@ -22,7 +26,12 @@ const modelOptions: Record<string, string[]> = {
   deepseek: ['deepseek-reasoner', 'deepseek-chat', 'deepseek-coder'],
 }
 
-export function SettingsPanel({ settings, onSettingsChange }: SettingsProps) {
+const asrModelOptions: Record<string, string[]> = {
+  whisper: ['large-v3'],
+  qwen: ['qwen3-asr-flash', 'qwen-audio-asr', 'qwen3-asr-flash-filetrans'],
+}
+
+export function SettingsPanel({ settings, onSettingsChange }: Readonly<SettingsProps>) {
   const handleChange = (key: string, value: string | number) => {
     onSettingsChange({ ...settings, [key]: value })
   }
@@ -33,6 +42,15 @@ export function SettingsPanel({ settings, onSettingsChange }: SettingsProps) {
       ...settings,
       provider: nextProvider,
       model: nextModel,
+    })
+  }
+
+  const handleAsrProviderChange = (nextProvider: string) => {
+    const nextModel = asrModelOptions[nextProvider]?.[0] ?? settings.asrModel
+    onSettingsChange({
+      ...settings,
+      asrProvider: nextProvider,
+      asrModel: nextModel,
     })
   }
 
@@ -102,6 +120,75 @@ export function SettingsPanel({ settings, onSettingsChange }: SettingsProps) {
                 value={settings.apiKey}
                 onChange={(e) => handleChange('apiKey', e.target.value)}
                 className="h-11 rounded-xl border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50 px-4 focus:ring-2 focus:ring-blue-500/20"
+              />
+            </div>
+
+            {/* ASR Provider */}
+            <div className="space-y-3">
+              <Label htmlFor="asrProvider" className="text-xs font-bold text-slate-400 uppercase">ASR 提供商</Label>
+              <div className="relative">
+                <select
+                  id="asrProvider"
+                  value={settings.asrProvider}
+                  onChange={(e) => handleAsrProviderChange(e.target.value)}
+                  className="flex h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50 px-4 py-2 text-sm transition-all focus:ring-2 focus:ring-blue-500/20 outline-none appearance-none cursor-pointer"
+                >
+                  <option value="whisper">本地 Whisper</option>
+                  <option value="qwen">通义千问 ASR</option>
+                </select>
+                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                </div>
+              </div>
+            </div>
+
+            {/* ASR Model */}
+            <div className="space-y-3">
+              <Label htmlFor="asrModel" className="text-xs font-bold text-slate-400 uppercase">ASR 模型</Label>
+              <div className="relative">
+                <select
+                  id="asrModel"
+                  value={settings.asrModel}
+                  onChange={(e) => handleChange('asrModel', e.target.value)}
+                  className="flex h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50 px-4 py-2 text-sm transition-all focus:ring-2 focus:ring-blue-500/20 outline-none appearance-none cursor-pointer"
+                >
+                  {(asrModelOptions[settings.asrProvider] ?? [settings.asrModel]).map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                </div>
+              </div>
+            </div>
+
+            {/* ASR API Key */}
+            <div className="space-y-3">
+              <Label htmlFor="asrApiKey" className="text-xs font-bold text-slate-400 uppercase">ASR API Key (通义千问)</Label>
+              <Input
+                id="asrApiKey"
+                type="password"
+                placeholder="sk-..."
+                value={settings.asrApiKey}
+                onChange={(e) => handleChange('asrApiKey', e.target.value)}
+                className="h-11 rounded-xl border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50 px-4 focus:ring-2 focus:ring-blue-500/20"
+                disabled={settings.asrProvider !== 'qwen'}
+              />
+            </div>
+
+            {/* ASR Base URL */}
+            <div className="space-y-3">
+              <Label htmlFor="asrBaseUrl" className="text-xs font-bold text-slate-400 uppercase">ASR Base URL</Label>
+              <Input
+                id="asrBaseUrl"
+                type="text"
+                placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
+                value={settings.asrBaseUrl}
+                onChange={(e) => handleChange('asrBaseUrl', e.target.value)}
+                className="h-11 rounded-xl border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50 px-4 focus:ring-2 focus:ring-blue-500/20"
+                disabled={settings.asrProvider !== 'qwen'}
               />
             </div>
 
