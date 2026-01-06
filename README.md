@@ -1,197 +1,152 @@
-# VideoProse v1.0
+# VideoProse
 
-将 Bilibili/YouTube 长视频（15min - 4h+）转化为具备深度阅读感的、保持原作者语感的结构化长文。
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com/)
+[![Next.js](https://img.shields.io/badge/Next.js-14-black.svg)](https://nextjs.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## ✨ 特性
+将长视频（B站 / YouTube / 本地音视频 / 粘贴字幕）转写成结构化长文，保留原作者的语感与节奏。
 
-- 🎬 支持 B站 和 YouTube 视频
-- 🎙️ 智能字幕提取或 ASR 转录（Faster-Whisper）
-- 📚 自动提取术语表，保证翻译一致性
-- ✂️ 语义感知切片，解决长文本"降智"问题
-- 🎭 保留原作者语感和情绪
-- 📄 生成结构化 Markdown 文档
+## 📖 项目简介
+
+VideoProse 让长视频快速变成好读的长文：智能获取字幕或执行 ASR，提取术语表，语义切片防止“降智”，再用 LLM 精修、排版，生成含摘要、目录、正文与高亮的完整文档。
+
+## ✨ 核心特性
+
+- 🔗 输入多源：B站 / YouTube 链接、本地视频音频、或直接粘贴字幕
+- 🎙️ 高效转写：Whisper 快速模式 + Qwen ASR 分片，长音频仍可流畅处理
+- 🧠 语义切片：根据语义/静默点分段，防止长内容失去上下文
+- 📚 术语表：先提取领域术语，保障后续翻译/引用一致
+- 📝 长文生成：摘要、目录、正文、高亮一键生成，保持原作者语感
+- 💻 前后端分离：FastAPI 后端 + Next.js/Tailwind 前端
+
+## 📋 环境要求
+
+- Python 3.10+
+- Node.js 18+
+- ffmpeg（音视频抽取）
+- 可选：yt-dlp（抓取站外视频）
 
 ## 🚀 快速开始
 
-### 安装
+### 1) 克隆与安装
 
 ```bash
-# 克隆项目
-git clone https://github.com/your-username/videoprose.git
-cd videoprose
+git clone https://github.com/singularityu820/VideoProse.git
+cd video2text
 
-# 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# 或 venv\Scripts\activate  # Windows
-
-# 安装依赖
+# Python 依赖
+python -m venv .venv
+./.venv/Scripts/activate    # Windows
+# 或 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 安装 yt-dlp（用于视频下载）
-pip install yt-dlp
-
-# 安装 ffmpeg（用于音频处理）
-# Windows: choco install ffmpeg
-# Mac: brew install ffmpeg
-# Linux: sudo apt install ffmpeg
-```
-
-### 配置
-
-复制环境变量模板并填入 API Key：
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件：
-
-```env
-# 选择 LLM 提供商
-DEFAULT_LLM_PROVIDER=anthropic
-DEFAULT_MODEL=claude-3-5-sonnet-20241022
-
-# 填入 API Key
-ANTHROPIC_API_KEY=sk-ant-your-key
-# 或 OPENAI_API_KEY=sk-your-key
-# 或 DEEPSEEK_API_KEY=your-key
-```
-
-### 使用
-
-#### 命令行
-
-```bash
-# 处理视频
-python -m videoprose.cli process "https://www.bilibili.com/video/BVxxx"
-
-# 指定输出路径
-python -m videoprose.cli process "https://www.youtube.com/watch?v=xxx" -o output.md
-
-# 使用不同的 LLM
-python -m videoprose.cli process "URL" --provider openai --model gpt-4o
-```
-
-#### Web 界面
-
-```bash
-# 1. 启动后端 API 服务
-cd src
-uvicorn videoprose.api:app --reload --port 8000
-
-# 2. 启动前端开发服务器（新终端）
+# 前端依赖
 cd web
 npm install
+cd ..
+```
+
+### 2) 配置环境变量
+
+复制 `.env.example` 为 `.env`，填入对应 Key（至少一个 LLM Key，若用 Qwen ASR 需 DASHScope 兼容 Key）：
+
+```env
+# LLM
+DEFAULT_LLM_PROVIDER=anthropic
+DEFAULT_MODEL=claude-3-5-sonnet-20241022
+ANTHROPIC_API_KEY=your-key
+
+# Whisper / Qwen ASR
+WHISPER_DEVICE=cpu
+QWEN_ASR_API_KEY=your-qwen-key
+QWEN_ASR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+### 3) 启动服务
+
+在仓库根目录：
+
+```bash
+# 后端（需在项目根目录，让 videoprose 成为可导入包）
+cd src
+uvicorn videoprose.api:app --host 0.0.0.0 --port 8000
+
+# 前端（新终端）
+cd web
 npm run dev
 ```
 
-然后访问 [http://localhost:3000](http://localhost:3000)
+前端默认访问 [http://localhost:3000](http://localhost:3000)，后端 [http://localhost:8000](http://localhost:8000)，Swagger 文档 [http://localhost:8000/docs](http://localhost:8000/docs)。
 
-#### Python API
+## 💡 使用说明
 
-```python
-from videoprose.workflow import process_video
+1. 打开前端，选择来源：链接 / 本地路径 / 粘贴字幕。
+2. 可在设置中切换 LLM、ASR（Whisper/Qwen）、目标字数、上下文重叠等参数。
+3. 提交后等待：
+   - 自动取字幕；若无字幕则抽取音频并 ASR。
+   - 术语表生成 → 语义分片 → 精修 → 汇总成长文。
+4. 在结果页查看摘要、目录、正文与高亮，可复制导出。
 
-# 处理视频
-document = process_video(
-    url="https://www.bilibili.com/video/BVxxx",
-    output_path="output.md",
-)
+本地路径示例（需后端可访问）：
 
-print(document.title)
-print(document.executive_summary)
+```text
+D:/media/video.mp4
+file:///D:/audio/podcast.wav
 ```
 
-## 📖 处理流程
+字幕粘贴：直接在表单中粘贴纯文本字幕，将跳过音频处理。
 
-```
-URL 输入
+## ⚙️ 关键配置
+
+- Whisper 快速模式：超过配置阈值（默认 15 分钟）自动切换 fast 模型与 beam 设置。
+- Qwen ASR 分片：长音频自动按秒切段并并行请求。
+- 切片参数：
+  - `CHUNK_TARGET_LENGTH` 目标字数（默认 1200）
+  - `CHUNK_MAX_LENGTH` 最大字数（默认 1500）
+  - `CONTEXT_OVERLAP_RATIO` 上下文重叠比例（默认 0.1）
+
+## 🧭 处理流程
+
+```text
+输入 (链接 / 本地 / 字幕)
     ↓
-┌─────────────────┐
-│  媒体处理模块    │ → 提取元数据、字幕或音频
-└─────────────────┘
+[媒体处理] 元数据 + 字幕/音频提取 (ffmpeg / yt-dlp)
     ↓
-┌─────────────────┐
-│  转录模块        │ → ASR 转录（若无字幕）
-└─────────────────┘
+[ASR] Whisper 快速模式 或 Qwen ASR 分片
     ↓
-┌─────────────────┐
-│  知识建模模块    │ → 提取术语、分析语气
-└─────────────────┘
+[术语表] 抽取实体与语气
     ↓
-┌─────────────────┐
-│  语义切片模块    │ → 智能分段（1200-1500字）
-└─────────────────┘
+[语义切片] 按静默/语义分段，保留重叠
     ↓
-┌─────────────────┐
-│  文本提纯引擎    │ → 去口语化、保留情绪
-└─────────────────┘
+[精修合成] LLM 去口语化、生成摘要/目录/正文/高亮
     ↓
-┌─────────────────┐
-│  聚合排版模块    │ → 生成目录、摘要、金句
-└─────────────────┘
-    ↓
-Markdown 文档输出
+输出 Markdown/结构化文档
 ```
 
-## 🔧 配置选项
+## 📁 目录结构
 
-### LLM 配置
-
-| 提供商 | 推荐模型 | 特点 |
-|--------|----------|------|
-| Anthropic | claude-3-5-sonnet | 文笔最细腻，推荐 |
-| OpenAI | gpt-4o | 通用性强 |
-| DeepSeek | deepseek-chat | 高性价比 |
-
-### 切片配置
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| CHUNK_TARGET_LENGTH | 1200 | 目标切片字数 |
-| CHUNK_MAX_LENGTH | 1500 | 最大切片字数 |
-| CONTEXT_OVERLAP_RATIO | 0.1 | 上下文重叠比例 |
-
-## 📁 项目结构
-
-```
-videoprose/
-├── src/videoprose/
-│   ├── __init__.py
-│   ├── models.py          # 数据模型
-│   ├── config.py          # 配置管理
-│   ├── llm.py             # LLM 客户端
-│   ├── workflow.py        # 主工作流
-│   ├── api.py             # FastAPI 后端
-│   ├── cli.py             # 命令行
-│   └── modules/
-│       ├── media_processor.py      # 媒体处理
-│       ├── transcription.py        # 转录
-│       ├── knowledge_architect.py  # 知识建模
-│       ├── semantic_chunker.py     # 语义切片
-│       ├── refinement_engine.py    # 文本提纯
-│       └── assembler.py            # 聚合排版
-├── web/                   # Next.js 前端
-│   ├── src/
-│   │   ├── app/           # 页面
-│   │   ├── components/    # 组件
-│   │   └── lib/           # 工具函数
-│   ├── package.json
-│   └── tailwind.config.ts
-├── requirements.txt
-├── pyproject.toml
-├── .env.example
-└── README.md
+```text
+video2text/
+├─ src/videoprose/        # 后端 & 处理流程
+│  ├─ api.py              # FastAPI 入口
+│  ├─ config.py           # 配置/默认参数
+│  ├─ modules/            # 媒体处理、转录、切片、精修
+│  └─ ...
+├─ web/                   # 前端 (Next.js + Tailwind)
+│  └─ src/app/            # 页面与组件
+├─ requirements.txt
+├─ pyproject.toml
+└─ README.md
 ```
 
-## 🗺️ 路线图
+## 🧰 技术栈
 
-- [x] Phase 1 (MVP): URL → Whisper → LLM 一次性转录
-- [x] Phase 2 (Chunking): 分段处理逻辑
-- [x] Phase 3 (Glossary): 前置知识提取
-- [x] Phase 4 (UI): Web 界面
-- [ ] Phase 5 (Multi-modal): 关键帧截取插入
+**后端**：FastAPI · Uvicorn · ffmpeg · yt-dlp · Whisper · 通义千问 ASR (兼容 OpenAI API)
+
+**前端**：Next.js · React · Tailwind CSS · Framer Motion · shadcn/ui
+
 
 ## 📄 许可证
 
